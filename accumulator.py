@@ -5,6 +5,7 @@ from hashlib import sha256
 from typing import Tuple, Union, Iterable
 from collections import namedtuple
 from dataclasses import dataclass
+import operator
 
 # https://eprint.iacr.org/2018/1188.pdf
 
@@ -16,9 +17,6 @@ HASH = sha256
 
 ADDITIVE_IDENTITY = 0
 MULTIPLICATIVE_IDENTITY = 1
-
-
-NonMembershipProof = namedtuple('NonMembershipProof', ('a', 'B'))
 
 
 def egcd(a: int, b: int) -> Tuple[int, int, int]:
@@ -37,27 +35,38 @@ def modinv(a: int, m: int) -> int:
     g, x, y = egcd(a, m)
     if g != 1:
         raise Exception('modular inverse does not exist')
-    else:
-        return x % m
+    return x % m
 
 
-def number_bits_bytes_ceil(num: int) -> Tuple[int, int]:
+def number_bits_bytes_ceil(num: int, max_bits: int = None) -> Tuple[int, int]:
     n_bits = ceil(log2(num))
+    if max_bits is not None and n_bits > max_bits:
+        n_bits = max_bits
     n_bytes = (n_bits + (8 - (n_bits % 8))) // 8
     return n_bits, n_bytes
 
 
 def number_bits_bytes_floor(num: int, max_bits: int = None) -> Tuple[int, int]:
     n_bits = floor(log2(num))
-    if max_bits and n_bits > max_bits:
+    if max_bits is not None and n_bits > max_bits:
         n_bits = max_bits
     n_bytes = (n_bits - (n_bits % 8)) // 8
     return n_bits, n_bytes
 
 
-def random_rsa_modulus(n_bits: int) -> int:
-    p = number.getPrime(n_bits, urandom)
-    q = number.getPrime(n_bits, urandom)
+def random_prime(n_bits: int, easy_sqrt: bool = False) -> int:
+    while True:
+        n = number.getPrime(n_bits, urandom)
+        if not easy_sqrt:
+            return n
+        # Congruency to 3 mod 4, means `sqrt(n) <- n^{{p+1}/4}`
+        if n % 4 == 3:
+            return n
+
+
+def random_rsa_modulus(n_bits: int, easy_sqrt: bool = False) -> int:
+    p = random_prime(n_bits, easy_sqrt)
+    q = random_prime(n_bits, easy_sqrt)
     return p * q
 
 
@@ -370,22 +379,28 @@ class NI_PoKE2:
     Q: GroupElement
     r: int
 
-    def __iter__(self):
+    def __iter__(self) -> Tuple[GroupElement, GroupElement, int]:
         return iter((self.z, self.Q, self.r))
 
     @classmethod
     def prove(cls, u: GroupElement, x: int, w: GroupElement):
+        # u = base
+        # x = exponent
+        # w = result
         # XXX: cambrian implementation differs with `g`
+        #      paper specifies hash to group, cambrian/accumulator uses generator (2)
         g = u.hash_to_group(u, w)
         z = g ** x
         l = hash2prime(u, w, z)
-        alpha = hash2int(u, w, z, l)
+        alpha = hash2int(u, w, z, l)  #  XXX: paper doesn't specify how big \alpha is
         q, r = divmod(x, l)
-        Q = (u * (g ** alpha)) ** q  # (ug^a)^q
+        Q = (u * (g ** alpha)) ** q   # (ug^a)^q
         return __class__(z, Q, r)
 
     @classmethod
     def verify(cls, u: GroupElement, w: GroupElement, proof: '__class__'):
+        # u = base
+        # w = result
         z, Q, r = proof
         g = u.hash_to_group(u, w)
         l = hash2prime(u, w, z)
@@ -394,6 +409,25 @@ class NI_PoKE2:
         beta = (u * (g ** alpha)) ** r  #  ug^a
         lhs = (Q ** l) * beta           #  Q^l(ug^a)^r
         return lhs == rhs
+
+
+@dataclass
+class NonMembershipProof:
+    item: int
+    a: int
+    B: GroupElement
+
+    def __iter__(self):
+        return iter((self.item, self.a, self.B))
+
+
+@dataclass
+class MembershipProof:
+    item: int
+    witness: GroupElement
+
+    def __iter__(self):
+        return iter((self.item, self.witness))
 
 
 class Accumulator(object):
@@ -430,8 +464,18 @@ class Accumulator(object):
             item = item.value        
         return self.add_prime(self._items.add(item))
 
-    def remove(self, item, witness: GroupElement) -> int:
-        if not self.verify(item, witness):
+    def DelWMem(self, proof: MembershipProof) -> int:
+        """
+        BBF'18 pg 16 § 4.2 figure 2
+
+        Remove an item, by providing its witness
+
+         - The witness is the previous value of the accumulator
+         - Thus, we verify the witness for the item (proof of inclusion)
+         - Then the new value for the accumulator becomes the witness
+        """
+        item, witness = proof
+        if not self.VerMem(item, witness):
             raise KeyError("invalid witness")
         if len(self.items) == 1:
             if witness != int(self.generator):
@@ -440,17 +484,57 @@ class Accumulator(object):
         self.value = witness
         return prime_item
 
-    def verify(self, item, witness: GroupElement) -> bool:
+    def VerMem(self, item, witness: GroupElement) -> bool:
         prime_item = self._items.as_prime(item)
         result = witness ** prime_item
         return result == self.value
 
-    def witness(self, our_item) -> GroupElement:
+    def BatchAdd(self, items: Iterable[int]):
+        """
+        BBF'18 pg 16 § 4.2 figure 2
+
+        Perform a batch-update of the accumulator
+
+         - Returns old value, and proof of the exponentation
+        """
+        x_star = reduce(operator.mul, items)
+        old_value = self.value
+        self.value = self.value ** x_star
+        return old_value, NI_PoE.prove(old_value, x_star, self.value)
+
+    def BatchDel(self, items: Iterable[MembershipProof]):
+        """
+        BBF'18 pg 16 § 4.2 figure 2
+
+        Given witnesses for many items, delete them all from the accumulator
+
+         - For each of the items, we verify their inclusion.
+        """
+        items = iter(items)
+
+        proof = next(items)        
+        item, witness = proof
+        if not self.VerMem(item, witness):
+            raise RuntimeError("Invalid witness %r" % (proof,))
+
+        new_value = old_value = self.value
+        # new_value = A_{t+1}
+
+        for proof in items:
+            x_i, witness = proof
+            if not self.VerMem(x_i, witness):
+                raise RuntimeError("Invalid witness %r" % (proof,))
+            new_value = ShamirTrick(new_value, witness, x_star, x_i)
+            x_star *= x_i
+
+        return new_value, NI_PoE.prove(old_value, x_star, new_value)
+
+    def MemWitCreate(self, our_item) -> GroupElement:
         """
         Provide a witness for an item which exists within the accumulator
         This is, essentially, the accumulator but without our item
         """
-        assert our_item in self._items
+        assert our_item in self
         witness = self.generator
         for item in self:
             if our_item == item:
@@ -458,6 +542,34 @@ class Accumulator(object):
             prime_item = self._items.as_prime(item)
             witness = witness ** prime_item
         return witness
+
+    def NonMemWitCreateFast_cambrial(self, our_item):
+        """
+        Translated from cambrian/accumulator::`prove_nonmembership`
+        """
+        # proof = self.NonMemWitCreate(our_item)
+        x = self.as_prime(our_item)
+        gcd, a, b = egcd(self.product, x)
+        # assert gcd != 1
+        g = self.generator
+        d = g ** a
+        v = self.value ** b
+        g_inv = g / v
+        poke2_proof = NI_PoKE2.prove(self.value, b, v)
+        poe_proof = NI_PoE.prove(d, x, g_inv)
+        return (d, v, g_inv, poke2_proof, poe_proof)
+
+    def NonMemWitCreateFast_paper(self, s_star, x_star):
+        """
+        BBF'18 pg 16 `NonMemWitCreate*`
+        """
+        a, b = Bezout(s_star, x_star)
+        V = self.value ** a
+        B = self.generator ** b
+        pi_V = NI_PoKE2.prove(self.value, a, V)             # V = A^a
+        pi_g = NI_PoE.prove(x_star, B, self.generator / V)  # B^x = g * (V^-1)
+        # Is this an equivalent proof satisfiable for `VerNonMem`
+        return (V, B, pi_V, pi_g)
 
     def NonMemWitCreate(self, our_item) -> NonMembershipProof:
         x = self.as_prime(our_item)
@@ -469,14 +581,14 @@ class Accumulator(object):
             raise RuntimeError("Inputs not co-prime")
         """
         B = self.generator ** b
-        return NonMembershipProof(a, B)
+        return NonMembershipProof(our_item, a, B)
 
-    def VerNonMem(self, proof: NonMembershipProof, our_item):
-        a, B = proof
+    def VerNonMem(self, proof: NonMembershipProof):
+        our_item, a, B = proof
         x = self.as_prime(our_item)
-        c = self.value ** a
-        d = B ** x
-        return (c * d) == self.generator
+        c = self.value ** a               # A^a
+        d = B ** x                        # B^x
+        return (c * d) == self.generator  # (A^a)(B^x) == g
 
 
 # --------------------
@@ -519,19 +631,19 @@ if __name__ == "__main__":
     left_acc.add(1)
     left_acc.add(2)
     left_wit = left_acc.add(left_acc)
-    left_a = left_acc.witness(1)
-    left_b = left_acc.witness(2)
+    left_a = left_acc.MemWitCreate(1)
+    left_b = left_acc.MemWitCreate(2)
 
     # Interestingly, the witness for the accumulator is it's self...
-    assert left_acc.verify(left_wit, left_wit)
-    assert left_acc.verify(1, left_a)
-    assert left_acc.verify(2, left_b)
+    assert left_acc.VerMem(left_wit, left_wit)
+    assert left_acc.VerMem(1, left_a)
+    assert left_acc.VerMem(2, left_b)
 
     left_exc = left_acc.NonMemWitCreate(3)
-    assert True == left_acc.VerNonMem(left_exc, 3)
+    assert True == left_acc.VerNonMem(left_exc)
 
     left_exc = left_acc.NonMemWitCreate(1)
-    assert False == left_acc.VerNonMem(left_exc, 1)
+    assert False == left_acc.VerNonMem(left_exc)
 
 
     # --------------------
@@ -541,12 +653,12 @@ if __name__ == "__main__":
     right_acc.add(3)
     right_acc.add(4)
     right_wit = right_acc.add(right_acc)
-    right_a = right_acc.witness(3)
-    right_b = right_acc.witness(4)
+    right_a = right_acc.MemWitCreate(3)
+    right_b = right_acc.MemWitCreate(4)
 
-    assert right_acc.verify(right_wit, right_wit)
-    assert right_acc.verify(3, right_a)
-    assert right_acc.verify(4, right_b)
+    assert right_acc.VerMem(right_wit, right_wit)
+    assert right_acc.VerMem(3, right_a)
+    assert right_acc.VerMem(4, right_b)
 
 
     # --------------------
